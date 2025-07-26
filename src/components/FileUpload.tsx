@@ -118,20 +118,67 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
 
   const analyzeAndFindSimilarFiles = async (file: File): Promise<{ analysis: FileAnalysis, similarFiles: SimilarityResult[] }> => {
     try {
-      // First, analyze the file content with AI
-      const analysis = await aiSimilarityService.analyzeFileContent(file)
+      // Simplified analysis - just basic file info for now
+      const analysis: FileAnalysis = {
+        contentType: file.type.includes('pdf') ? 'PDF Document' : 
+                    file.type.startsWith('image/') ? 'Image File' :
+                    file.type.includes('document') ? 'Text Document' : 'File',
+        keyTerms: [file.name.split('.')[0]],
+        documentPurpose: `${file.type.includes('pdf') ? 'PDF Document' : 
+                         file.type.startsWith('image/') ? 'Image File' :
+                         file.type.includes('document') ? 'Text Document' : 'File'} for organization`,
+        suggestedCategory: 'general',
+        extractedMetadata: {
+          fileName: file.name,
+          fileSize: file.size,
+          fileType: file.type
+        }
+      }
       
-      // Then find similar files using AI-powered comparison
-      const similarFiles = await aiSimilarityService.findSimilarFiles(file, organizationId, analysis)
+      // Simple similarity check based on file names
+      const existingFiles = await blink.db.files.list({
+        where: {
+          organization_id: organizationId,
+          is_latest_version: "1"
+        },
+        limit: 10
+      })
+
+      const similarFiles: SimilarityResult[] = []
+      const fileName = file.name.toLowerCase()
+      const fileBaseName = fileName.split('.')[0]
+
+      for (const existingFile of existingFiles) {
+        const existingName = existingFile.name.toLowerCase()
+        const existingBaseName = existingName.split('.')[0]
+        
+        // Simple name similarity
+        const nameSimilarity = calculateSimilarity(fileBaseName, existingBaseName)
+        
+        if (nameSimilarity > 0.5) {
+          similarFiles.push({
+            fileId: existingFile.id,
+            fileName: existingFile.name,
+            versionLabel: existingFile.version_label,
+            uploadedBy: existingFile.uploaded_by,
+            createdAt: existingFile.created_at,
+            similarityScore: nameSimilarity,
+            similarityReason: `Similar file name (${Math.round(nameSimilarity * 100)}% match)`,
+            contentSimilarity: nameSimilarity,
+            nameSimilarity: nameSimilarity,
+            aiAnalysis: `File names are similar - this might be an updated version of "${existingFile.name}"`
+          })
+        }
+      }
       
-      return { analysis, similarFiles }
+      return { analysis, similarFiles: similarFiles.sort((a, b) => b.similarityScore - a.similarityScore) }
     } catch (error) {
       console.error('Error analyzing file and finding similar files:', error)
       return { 
         analysis: {
-          contentType: 'unknown',
-          keyTerms: [],
-          documentPurpose: 'Unknown document purpose',
+          contentType: 'File',
+          keyTerms: [file.name],
+          documentPurpose: 'Document file',
           suggestedCategory: 'general',
           extractedMetadata: {}
         }, 
@@ -142,10 +189,36 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
 
   const generateVersionLabel = async (organizationId: string, existingFileId?: string): Promise<string> => {
     try {
-      return await aiSimilarityService.generateVersionLabel(organizationId, existingFileId)
+      if (existingFileId) {
+        // Get existing file to increment version
+        const existingFile = await blink.db.files.list({
+          where: { id: existingFileId }
+        })
+        
+        if (existingFile[0]) {
+          const currentVersion = existingFile[0].version_label
+          // Simple version increment
+          const versionMatch = currentVersion.match(/v(\d+)\.(\d+)\.(\d+)/)
+          if (versionMatch) {
+            const [, major, minor, patch] = versionMatch.map(Number)
+            const prefix = currentVersion.split('-v')[0]
+            return `${prefix}-v${major}.${minor}.${patch + 1}`
+          }
+        }
+      }
+
+      // Get next sequential number for new files
+      const existingFiles = await blink.db.files.list({
+        where: { organization_id: organizationId },
+        orderBy: { sequential_number: 'desc' },
+        limit: 1
+      })
+
+      const nextSeq = existingFiles[0]?.sequential_number ? existingFiles[0].sequential_number + 1 : 1
+      return `VT-${nextSeq.toString().padStart(2, '0')}-v1.0.0`
     } catch (error) {
       console.error('Error generating version label:', error)
-      return 'VT-01-v1.0.0'
+      return `VT-01-v1.0.0`
     }
   }
 
@@ -163,34 +236,22 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
       
       // Create document metadata
       const documentMetadata: DocumentMetadata = {
-        documentReference: aiSimilarityService.generateDocumentReference(organizationId, uploadFile.file.type),
+        documentReference: `DOC-${Date.now()}`,
         revisionNumber: versionLabel,
         versionLabel: versionLabel,
         lastModified: new Date().toISOString(),
         modifiedBy: user.email || user.id,
-        organizationName: 'Sample Organization', // This should come from organization data
+        organizationName: 'Sample Organization',
         changeNotes: uploadFile.versionNotes || (replaceFileId ? 'Updated version' : 'Initial version')
       }
 
-      // Embed metadata in document if enabled
-      let finalFileUrl = ''
-      const metadataEmbedding = await documentMetadataService.embedMetadataInDocument(
+      // Upload the original file directly (simplified approach)
+      const { publicUrl } = await blink.storage.upload(
         uploadFile.file,
-        documentMetadata,
-        organizationId
+        `organizations/${organizationId}/files/${Date.now()}_${uploadFile.file.name}`,
+        { upsert: true }
       )
-
-      if (metadataEmbedding.success && metadataEmbedding.modifiedFileUrl) {
-        finalFileUrl = metadataEmbedding.modifiedFileUrl
-      } else {
-        // Upload original file if metadata embedding failed
-        const { publicUrl } = await blink.storage.upload(
-          uploadFile.file,
-          `organizations/${organizationId}/files/${uploadFile.file.name}`,
-          { upsert: true }
-        )
-        finalFileUrl = publicUrl
-      }
+      const finalFileUrl = publicUrl
 
       // Simulate upload progress
       for (let progress = 0; progress <= 100; progress += 20) {
@@ -216,10 +277,10 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
           name: uploadFile.file.name,
           original_name: uploadFile.file.name,
           file_path: finalFileUrl,
-          file_size: uploadFile.file.size,
-          file_type: uploadFile.file.type,
+          file_size: uploadFile.file.size.toString(),
+          file_type: uploadFile.file.type || 'application/octet-stream',
           organization_id: organizationId,
-          folder_path: currentPath,
+          folder_path: currentPath || '/',
           uploaded_by: user.id,
           parent_file_id: replaceFileId,
           version_label: versionLabel,
@@ -263,8 +324,7 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
             newVersion: versionLabel,
             fileSize: uploadFile.file.size,
             fileName: uploadFile.file.name,
-            metadataEmbedded: metadataEmbedding.success,
-            embeddingMethod: metadataEmbedding.embeddingMethod
+            fileType: uploadFile.file.type
           }),
           ai_similarity_score: uploadFile.similarFiles?.[0]?.similarityScore || 1.0,
           replaced_file_id: replaceFileId,
@@ -277,10 +337,10 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
           name: uploadFile.file.name,
           original_name: uploadFile.file.name,
           file_path: finalFileUrl,
-          file_size: uploadFile.file.size,
-          file_type: uploadFile.file.type,
+          file_size: uploadFile.file.size.toString(),
+          file_type: uploadFile.file.type || 'application/octet-stream',
           organization_id: organizationId,
-          folder_path: currentPath,
+          folder_path: currentPath || '/',
           uploaded_by: user.id,
           version_label: versionLabel,
           version_notes: uploadFile.versionNotes || 'Initial version',
@@ -310,8 +370,6 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
             fileType: uploadFile.file.type,
             versionLabel: versionLabel,
             documentReference: documentMetadata.documentReference,
-            metadataEmbedded: metadataEmbedding.success,
-            embeddingMethod: metadataEmbedding.embeddingMethod,
             aiAnalysis: uploadFile.fileAnalysis
           }),
           created_at: now
