@@ -245,13 +245,16 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
         changeNotes: uploadFile.versionNotes || (replaceFileId ? 'Updated version' : 'Initial version')
       }
 
-      // Upload the original file directly (simplified approach)
+      // Upload the file with a simple, clean path
+      const fileName = `${Date.now()}_${uploadFile.file.name}`
       const { publicUrl } = await blink.storage.upload(
         uploadFile.file,
-        `organizations/${organizationId}/files/${Date.now()}_${uploadFile.file.name}`,
+        `files/${fileName}`,
         { upsert: true }
       )
       const finalFileUrl = publicUrl
+      
+      console.log('File uploaded to:', finalFileUrl) // Debug log
 
       // Simulate upload progress
       for (let progress = 0; progress <= 100; progress += 20) {
@@ -265,41 +268,45 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
       const now = new Date().toISOString()
 
       if (replaceFileId) {
-        // Create new version of existing file
-        await blink.db.files.update(replaceFileId, { is_latest_version: "0" })
+        // Get the existing file to update
+        const existingFiles = await blink.db.files.list({ where: { id: replaceFileId } })
+        const existingFile = existingFiles[0]
         
-        // Get sequential number from parent file
-        const parentFile = await blink.db.files.list({ where: { id: replaceFileId } })
-        const sequentialNumber = parentFile[0]?.sequential_number || 1
+        if (!existingFile) {
+          throw new Error('File to replace not found')
+        }
         
-        const newVersion = await blink.db.files.create({
-          id: fileId,
+        // Store the old version in file_versions table first
+        await blink.db.fileVersions.create({
+          id: `version_${Date.now()}_old`,
+          file_id: replaceFileId,
+          version_label: existingFile.version_label,
+          file_path: existingFile.file_path,
+          file_size: Number(existingFile.file_size) || 0,
+          uploaded_by: existingFile.uploaded_by,
+          version_notes: existingFile.version_notes || 'Previous version',
+          is_current: "0",
+          created_at: existingFile.updated_at || existingFile.created_at
+        })
+        
+        // Update the existing file record with new version
+        await blink.db.files.update(replaceFileId, {
           name: uploadFile.file.name,
           original_name: uploadFile.file.name,
           file_path: finalFileUrl,
           file_size: uploadFile.file.size.toString(),
           file_type: uploadFile.file.type || 'application/octet-stream',
-          organization_id: organizationId,
-          folder_path: currentPath || '/',
-          uploaded_by: user.id,
-          parent_file_id: replaceFileId,
           version_label: versionLabel,
           version_notes: uploadFile.versionNotes || 'Updated version',
           similarity_hash: fileHash,
           content_hash: fileHash,
-          is_latest_version: "1",
-          document_reference: documentMetadata.documentReference,
-          revision_number: versionLabel,
-          company_prefix: 'VT',
-          sequential_number: sequentialNumber,
-          revision_sequence: (parentFile[0]?.revision_sequence || 0) + 1,
-          created_at: now,
+          revision_sequence: (existingFile.revision_sequence || 0) + 1,
           updated_at: now
         })
 
-        // Add to version history
+        // Add the new version to version history
         await blink.db.fileVersions.create({
-          id: `version_${Date.now()}`,
+          id: `version_${Date.now()}_new`,
           file_id: replaceFileId,
           version_label: versionLabel,
           file_path: finalFileUrl,
@@ -314,13 +321,13 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
         await blink.db.fileAuditTrail.create({
           id: `audit_${Date.now()}`,
           file_id: replaceFileId,
-          version_id: fileId,
+          version_id: `version_${Date.now()}_new`,
           organization_id: organizationId,
           user_id: user.id,
           action: 'version_update',
           change_summary: uploadFile.versionNotes || 'File updated with new version',
           detailed_changes: JSON.stringify({
-            previousVersion: parentFile[0]?.version_label,
+            previousVersion: existingFile.version_label,
             newVersion: versionLabel,
             fileSize: uploadFile.file.size,
             fileName: uploadFile.file.name,
@@ -380,9 +387,10 @@ export function FileUpload({ organizationId, currentPath, onUploadComplete }: Fi
       await blink.db.activityLog.create({
         id: `activity_${Date.now()}`,
         organization_id: organizationId,
+        file_id: replaceFileId || fileId,
         user_id: user.id,
         action: replaceFileId ? 'version_upload' : 'upload',
-        details: `Uploaded ${uploadFile.file.name} (${versionLabel})`,
+        details: `${replaceFileId ? 'Updated' : 'Uploaded'} ${uploadFile.file.name} (${versionLabel})`,
         created_at: now
       })
 

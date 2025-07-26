@@ -124,8 +124,30 @@ export function VersionHistory({ fileId, fileName, isOpen, onClose, onRestore }:
   }, [isOpen, fileId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDownload = (version: FileVersion) => {
-    // Open the file URL in a new tab to download
-    window.open(version.file_path, '_blank')
+    console.log('Downloading version:', version.file_path) // Debug log
+    
+    // Check if the URL is valid
+    if (!version.file_path || version.file_path === '' || version.file_path === 'null') {
+      console.error('Invalid file path:', version.file_path)
+      alert('File path is invalid.')
+      return
+    }
+    
+    // Try to download the file
+    try {
+      // Create a temporary link element to trigger download
+      const link = document.createElement('a')
+      link.href = version.file_path
+      link.download = `${fileName}_${version.version_label}`
+      link.target = '_blank'
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+    } catch (error) {
+      console.error('Download error:', error)
+      // Fallback to opening in new tab
+      window.open(version.file_path, '_blank')
+    }
   }
 
   const handleRestore = async (version: FileVersion) => {
